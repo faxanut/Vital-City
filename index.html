@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>World Map Prototype — Click empty land</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha384-xodZBntMZQ2v3XgqkQb1Qm4QbWfQ2Q5b8p5pX0x0x0x0x0x0x0x0x" crossorigin=""/>
+  <style>
+    html,body,#map { height: 100%; margin: 0; }
+    body { font-family: system-ui, -apple-system, Arial; }
+    #map { position: absolute; left: 0; right: 320px; top: 0; bottom: 0; }
+    #sidebar { position: absolute; right: 0; top: 0; width: 320px; bottom: 0; border-left: 1px solid #ddd; padding: 12px; overflow: auto; background: #fff; }
+    .btn { display:inline-block;padding:6px 10px;border-radius:6px;background:#1976d2;color:#fff;text-decoration:none;margin:4px 0;cursor:pointer }
+    .muted { color: #666; font-size: 0.9rem }
+    h3{margin:6px 0}
+    #loading{display:none}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="sidebar">
+    <h2>Prototype Controls</h2>
+    <p class="muted">Click anywhere on the map. If the clicked point is not inside any building footprint (fetched from OSM via Overpass), the app will treat it as "empty land" and show details.</p>
+
+    <button id="btnFetchBuildings" class="btn">Fetch buildings near center</button>
+    <button id="btnClear" class="btn">Clear buildings</button>
+    <div style="margin-top:12px">Radius for building fetch (meters):<br><input id="radius" type="number" value="300" style="width:100%"></div>
+
+    <h3>Clicked point</h3>
+    <div id="info">No point clicked yet.</div>
+
+    <h3>Logs</h3>
+    <div id="logs" style="font-family:monospace; font-size:12px; white-space:pre-wrap; max-height:320px; overflow:auto; border-top:1px solid #eee; padding-top:8px"></div>
+
+    <div id="loading">Loading…</div>
+    <hr>
+    <small class="muted">Notes: This uses public OSM services (Nominatim & Overpass). Respect rate limits. For production, host your own Overpass/Nominatim or use proper API keys.</small>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+  <script>
+    // Simple single-file prototype
+    const map = L.map('map').setView([20,0], 2);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const buildingLayer = L.geoJSON(null, { style: { color: '#666', weight: 1, fillOpacity: 0.7 } }).addTo(map);
+
+    const infoDiv = document.getElementById('info');
+    const logs = document.getElementById('logs');
+    const loadingEl = document.getElementById('loading');
+
+    function log(...args){ logs.textContent = (new Date().toLocaleTimeString()) + ' — ' + args.join(' ') + '\n' + logs.textContent }
+
+    map.on('click', async (e) => {
+      const { lat, lng } = e.latlng;
+      log('Map clicked', lat.toFixed(5), lng.toFixed(5));
+
+      // Is point inside any building polygon?
+      const point = turf.point([lng, lat]);
+      let insideAny = false;
+      buildingLayer.eachLayer(layer => {
+        try{
+          const gj = layer.toGeoJSON();
+          if (gj.geometry) {
+            if (turf.booleanPointInPolygon(point, gj)) { insideAny = true; }
+          }
+        }catch(e){ /* ignore */ }
+      });
+
+      if (insideAny) {
+        infoDiv.innerHTML = `<b>Clicked point is inside a building footprint.</b><br>Country/state will still be fetched.`;
+      } else {
+        infoDiv.innerHTML = `<b>Clicked point appears to be empty land.</b>`;
+      }
+
+      // Always show reverse geocode details (country/state/city)
+      const details = await reverseGeocode(lat, lng);
+      infoDiv.innerHTML += `<br><br><b>Details</b><br>Country: ${details.country || '—'}<br>State: ${details.state || '—'}<br>City: ${details.city || details.town || details.village || '—'}`;
+
+      log('Reverse geocode:', details.display_name || 'no-name');
+    });
+
+    async function reverseGeocode(lat, lon){
+      try{
+        const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lon)}&zoom=18&addressdetails=1`;
+        const res = await fetch(url, {headers:{'Accept':'application/json'}});
+        if(!res.ok) throw new Error('Nominatim error');
+        const data = await res.json();
+        const addr = data.address || {};
+        return { country: addr.country, state: addr.state, city: addr.city, town: addr.town, village: addr.village, display_name: data.display_name };
+      }catch(err){ log('Reverse geocode failed', err.message); return {}; }
+    }
+
+    // Overpass query to fetch building ways/relations around a latlng with radius
+    async function fetchBuildingsAround(lat, lon, radiusMeters=300){
+      loading(true);
+      const query = `[
+        out:json][timeout:25];
+        (
+          way["building"](around:${radiusMeters},${lat},${lon});
+          relation["building"](around:${radiusMeters},${lat},${lon});
+        );
+        out geom;`;
+
+      try{
+        const res = await fetch('https://overpass-api.de/api/interpreter', {
+          method: 'POST',
+          body: query,
+          headers: { 'Content-Type': 'text/plain' }
+        });
+        if(!res.ok) throw new Error('Overpass error');
+        const data = await res.json();
+        const geojson = osmtogeojson(data);
+        buildingLayer.clearLayers();
+        buildingLayer.addData(geojson);
+        log('Fetched buildings:', (geojson.features||[]).length);
+      }catch(err){ log('Fetch buildings failed', err.message); }
+      loading(false);
+    }
+
+    document.getElementById('btnFetchBuildings').addEventListener('click', ()=>{
+      const c = map.getCenter();
+      const r = parseInt(document.getElementById('radius').value||300, 10);
+      fetchBuildingsAround(c.lat, c.lng, r);
+    });
+    document.getElementById('btnClear').addEventListener('click', ()=>{ buildingLayer.clearLayers(); log('Cleared buildings') });
+
+    function loading(on){ loadingEl.style.display = on? 'block':'none'; }
+
+    // tiny osmtogeojson implementation: include minimal converter
+    // We'll bring in a small helper adapted from osmtogeojson project.
+    // NOTE: For production include the official osmtogeojson lib.
+    function osmtogeojson(osm){
+      const features = [];
+      const nodes = {};
+      (osm.elements||[]).forEach(el=>{ if(el.type==='node') nodes[el.id] = el });
+      (osm.elements||[]).forEach(el=>{
+        if(el.type==='way' && el.geometry){
+          const coords = el.geometry.map(n=>[n.lon, n.lat]);
+          features.push({ type: 'Feature', properties: el.tags||{}, geometry: { type: 'Polygon', coordinates: [coords] } });
+        }
+        if(el.type==='relation' && el.members){
+          // naive: try to assemble multipolygon
+          const polys = [];
+          // relations are complicated; skip deep assembly and instead convert member ways that have geometry
+          el.members.forEach(m=>{ if(m.type==='way' && m.geometry){ const coords = (m.geometry||[]).map(n=>[n.lon,n.lat]); polys.push(coords); } });
+          if(polys.length) features.push({ type:'Feature', properties: el.tags||{}, geometry: { type: 'MultiPolygon', coordinates: polys.map(p=>[p]) } });
+        }
+      });
+      return { type: 'FeatureCollection', features };
+    }
+
+    // initial log
+    log('Prototype loaded. Click the map to try. Use "Fetch buildings near center" to load footprints around the current center.');
+  </script>
+</body>
+</html>
